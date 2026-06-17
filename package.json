@@ -1,0 +1,13 @@
+{
+  "name": "superfittingroom-legal",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Legal pages (Privacy Policy & Terms of Service) for super fitting room",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "marked": "^12.0.0"
+  }
+}
