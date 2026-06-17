@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { gzipSync } from "node:zlib";
 import { marked } from "marked";
 
 /**
@@ -147,6 +148,29 @@ ${bodyHtml}
 </html>`;
 }
 
+// Self-contained HTML for in-app offline rendering: no site nav / no language
+// switcher (the app selects the file by its own locale). Inline CSS only.
+function appLayout({ loc, title, bodyHtml }) {
+  const lang = LOCALES[loc].htmlLang;
+  const mt = loc !== "en" ? `<div class="mt">${MT_NOTICE[loc]}</div>` : "";
+  return `<!DOCTYPE html>
+<html lang="${lang}">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>${title}</title>
+<style>${css}</style>
+</head>
+<body>
+<main class="wrap">
+${mt}
+${bodyHtml}
+<div class="footer">© ${new Date().getFullYear()} ${APP_NAME} (Hong Kong) Limited. Last updated ${UPDATED}.</div>
+</main>
+</body>
+</html>`;
+}
+
 function sha(s) {
   return createHash("sha256").update(s, "utf8").digest("hex").slice(0, 16);
 }
@@ -235,23 +259,21 @@ for (const page of PAGES) {
   enBodies[page.slug] = marked.parse(readFileSync(page.src, "utf8"));
 }
 
-// ---- translate (if a key is present); populate BUILT before writing ----
-const haveKey = Boolean(DEEPL_KEY || GOOGLE_KEY);
+// ---- translate (uses API if key set, otherwise reuses cache/); populate BUILT ----
 const translated = {};
-if (haveKey) {
-  for (const loc of Object.keys(LOCALES)) {
-    if (loc === "en") continue;
-    const bodies = {};
-    let ok = true;
-    for (const page of PAGES) {
-      const body = await getTranslatedBody(enBodies[page.slug], loc, page.slug);
-      if (body == null) { ok = false; break; }
-      bodies[page.slug] = body;
-    }
-    if (ok) { translated[loc] = bodies; BUILT.push(loc); }
+for (const loc of Object.keys(LOCALES)) {
+  if (loc === "en") continue;
+  const bodies = {};
+  let ok = true;
+  for (const page of PAGES) {
+    const body = await getTranslatedBody(enBodies[page.slug], loc, page.slug);
+    if (body == null) { ok = false; break; }
+    bodies[page.slug] = body;
   }
-} else {
-  console.log("No DEEPL_API_KEY / GOOGLE_TRANSLATE_API_KEY set — built English only.");
+  if (ok) { translated[loc] = bodies; BUILT.push(loc); }
+}
+if (BUILT.length === 1) {
+  console.log("Only English built (no API key and no cache for other locales).");
 }
 
 // ---- write all pages (switcher now knows the full BUILT set) ----
@@ -297,4 +319,101 @@ console.log("built index.html (root redirect)");
 
 writeFileSync(".nojekyll", "", "utf8");
 console.log("wrote .nojekyll");
+
+// ---- emit FlutterFlow custom widget (offline, base64-embedded, all locales) ----
+function minify(html) {
+  return html.replace(/>\s+</g, "><").trim();
+}
+function gz64(s) {
+  return gzipSync(Buffer.from(s, "utf8"), { level: 9 }).toString("base64");
+}
+function dartMap(slug, title) {
+  const entries = BUILT.map((loc) => {
+    const body = loc === "en" ? enBodies[slug] : translated[loc][slug];
+    const html = minify(appLayout({ loc, title, bodyHtml: body }));
+    return `  '${loc}': '${gz64(html)}',`;
+  }).join("\n");
+  return `{\n${entries}\n}`;
+}
+
+const dart = `// FlutterFlow Custom Widget: LegalWebView
+// Renders bundled Privacy Policy / Terms of Service fully OFFLINE (no network).
+// Content is base64-embedded for every supported language and selected by the
+// app's current locale (falls back to English). English is the governing version.
+//
+// SETUP IN FLUTTERFLOW:
+//   1. Custom Code -> Add Custom Widget -> name it "LegalWebView".
+//   2. Add parameters: docType (String, required), width (double?), height (double?).
+//   3. Dependencies field (one per line):
+//        webview_flutter: ^4.8.0
+//        archive: ^3.6.1
+//   4. Paste this whole file as the widget code, then Save & Compile.
+//   5. Drop LegalWebView on the PrivacyPolicy page (docType: "privacy") and the
+//      TermsOfService page (docType: "terms"), set width=double.infinity, height to fill.
+//   6. (Optional) Point Profile entries back to navigate to these pages instead of Launch URL.
+
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:webview_flutter/webview_flutter.dart';
+import 'package:archive/archive.dart';
+
+class LegalWebView extends StatefulWidget {
+  const LegalWebView({
+    super.key,
+    this.width,
+    this.height,
+    required this.docType,
+  });
+
+  final double? width;
+  final double? height;
+  final String docType; // 'privacy' or 'terms'
+
+  @override
+  State<LegalWebView> createState() => _LegalWebViewState();
+}
+
+class _LegalWebViewState extends State<LegalWebView> {
+  WebViewController? _controller;
+  String? _loadedKey;
+
+  Map<String, String> get _data =>
+      widget.docType == 'terms' ? _termsB64 : _privacyB64;
+
+  String _pickLang() {
+    final code = Localizations.localeOf(context).languageCode.toLowerCase();
+    return _data.containsKey(code) ? code : 'en';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final lang = _pickLang();
+    final key = '\${widget.docType}:\$lang';
+    if (_controller == null || _loadedKey != key) {
+      final encoded = _data[lang] ?? _data['en']!;
+      final bytes = GZipDecoder().decodeBytes(base64.decode(encoded));
+      final html = utf8.decode(bytes);
+      _controller = WebViewController()
+        ..setJavaScriptMode(JavaScriptMode.disabled)
+        ..setBackgroundColor(const Color(0x00000000))
+        ..loadHtmlString(html);
+      _loadedKey = key;
+    }
+    return SizedBox(
+      width: widget.width,
+      height: widget.height,
+      child: WebViewWidget(controller: _controller!),
+    );
+  }
+}
+
+const Map<String, String> _privacyB64 = ${dartMap("privacy-policy", "Privacy Policy")};
+
+const Map<String, String> _termsB64 = ${dartMap("terms-of-service", "Terms of Service")};
+`;
+
+mkdirSync("flutter", { recursive: true });
+writeFileSync("flutter/legal_webview.dart", dart, "utf8");
+console.log("built flutter/legal_webview.dart");
+
 console.log("locales built:", BUILT.join(", "));
